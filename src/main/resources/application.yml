@@ -1,0 +1,29 @@
+server:
+  port: 8180 # API 게이트웨이 서버의 포트
+
+jwt:
+  secret: my_super_secret_key_that_is_long_enough_and_random # JWT 서명에 사용할 비밀키
+
+spring:
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: edge_service
+              uri: http://localhost:8181
+              predicates:
+                - Path=/api/user/**
+            - id: auth_service
+              uri: http://localhost:8182
+              predicates:
+                - Path=/api/auth/**
+      observability:
+        enabled: true
+
+logging:
+  level:
+    com.example.boilerplate.gateway.common.filter: DEBUG
+    org.springframework.cloud.gateway: DEBUG
+    reactor.netty: DEBUG
+    org.springframework.web.reactive: DEBUG    # WebFlux 디버그 로깅 추가
