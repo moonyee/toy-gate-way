@@ -6,9 +6,13 @@ import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.client.circuitbreaker.ReactiveCircuitBreakerFactory;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -21,10 +25,17 @@ import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 @Slf4j
 @Component
@@ -32,11 +43,20 @@ public class JwtAuthenticationFilter implements WebFilter {
 
     private final SecretKey signingKey;
     private static final String BEARER_PREFIX = "Bearer ";
-    private static final String[] LOGIN_PATH = { "/api/auth/login", "/api/auth2/login" };
+    private static final String[] LOGIN_PATH = { "/api/auth/login" };
+    private final ReactiveStringRedisTemplate redisTemplate;
 
-    public JwtAuthenticationFilter(@Value("${jwt.secret:my_super_secret_key_that_is_long_enough_and_random}") String secretKey) {
+    private final ReactiveCircuitBreakerFactory circuitBreaker;
+
+    public JwtAuthenticationFilter(
+        @Value("${jwt.secret}") String secretKey,
+		ReactiveStringRedisTemplate redisTemplate,
+        ReactiveCircuitBreakerFactory circuitBreaker
+    ) {
         this.signingKey = Keys.hmacShaKeyFor(secretKey.getBytes(StandardCharsets.UTF_8));
-    }
+		this.redisTemplate = redisTemplate;
+		this.circuitBreaker = circuitBreaker;
+	}
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
@@ -52,16 +72,30 @@ public class JwtAuthenticationFilter implements WebFilter {
             }
         }
 
-        // Authorization 헤더 확인
-        String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
-        if (authHeader == null || !authHeader.startsWith(BEARER_PREFIX)) {
-            log.warn("### No Authorization header or invalid format");
-            return onError(exchange, "No valid authorization header", HttpStatus.UNAUTHORIZED);
-        }
-
         return extractAndValidateToken(request)
             .doOnSuccess(jwt -> log.info("### JWT token successfully extracted."))
             .flatMap(this::parseJwt)
+            .flatMap(claims -> {
+                String userId = claims.getSubject();
+                String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+                String jwt = authHeader.substring(BEARER_PREFIX.length());
+
+                // [수정] 고도화된 Redis 키 구조: "AUTH:userId:token"
+                String redisKey = "AUTH:" + userId + ":" + jwt;
+
+                log.info("### Gateway checking Redis key: {}", redisKey);
+
+                return redisTemplate.opsForValue().get(redisKey)
+                    .flatMap(savedToken -> {
+                        // 사실 키 자체에 토큰이 포함되어 있으므로, 데이터가 존재한다는 것만으로도 검증이 됩니다.
+                        if (jwt.equals(savedToken)) {
+                            return Mono.just(claims);
+                        }
+                        return Mono.error(new RuntimeException("Token mismatch"));
+                    })
+                    // Redis에 해당 세션 키가 없으면 로그아웃되었거나 만료된 것으로 간주
+                    .switchIfEmpty(Mono.error(new RuntimeException("No session found in Redis for this token")));
+            })
             .doOnSuccess(claims -> log.info("### JWT parsed for user: {}", claims.getSubject()))
             .flatMap(claims -> processRequest(exchange, chain, claims))
             .doOnSuccess(v -> {
@@ -90,13 +124,13 @@ public class JwtAuthenticationFilter implements WebFilter {
     }
 
     private Mono<Claims> parseJwt(String jwt) {
-        return Mono.fromCallable(() ->
-            Jwts.parserBuilder()
+        return Mono.fromCallable(() -> Jwts.parserBuilder()
                 .setSigningKey(signingKey)
                 .build()
                 .parseClaimsJws(jwt)
-                .getBody()
-        );
+                .getBody())
+            .subscribeOn(Schedulers.boundedElastic());
+
     }
 
     private Mono<Void> processRequest(ServerWebExchange exchange, WebFilterChain chain, Claims claims) {
@@ -141,7 +175,24 @@ public class JwtAuthenticationFilter implements WebFilter {
     private Mono<Void> onError(ServerWebExchange exchange, String err, HttpStatus httpStatus) {
         ServerHttpResponse response = exchange.getResponse();
         response.setStatusCode(httpStatus);
-        log.debug("Authentication error: {}", err);
-        return response.setComplete();
+
+        // JSON 형태의 에러 응답
+        Map<String, Object> errorResponse = new HashMap<>();
+        errorResponse.put("timestamp", Instant.now().toString());
+        errorResponse.put("status", httpStatus.value());
+        errorResponse.put("error", httpStatus.getReasonPhrase());
+        errorResponse.put("message", err);
+
+        byte[] bytes = null;
+        try {
+            bytes = new ObjectMapper().writeValueAsBytes(errorResponse);
+        } catch (JsonProcessingException e) {
+            log.error("Error creating error response", e);
+        }
+
+        DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
+        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        return response.writeWith(Mono.just(buffer));
+
     }
 }
