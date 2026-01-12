@@ -136,7 +136,7 @@ public class JwtAuthenticationFilter implements WebFilter {
     private Mono<Void> processRequest(ServerWebExchange exchange, WebFilterChain chain, Claims claims) {
         // 1. JWT Claims(페이로드)에서 사용자 아이디(subject)를 추출합니다.
         // 'sub'는 JWT 표준 클레임으로, 주로 사용자의 고유 식별자를 담습니다.
-        String username = claims.getSubject();
+        String userid = claims.getSubject();
 
         // 2. Spring Security용 Authentication 객체를 생성합니다.
         // UsernamePasswordAuthenticationToken은 인증된 사용자를 나타내는 표준 클래스입니다.
@@ -144,7 +144,7 @@ public class JwtAuthenticationFilter implements WebFilter {
         // - 두 번째 인자: 자격 증명(Credentials), 여기서는 이미 토큰 검증을 마쳤으므로 null
         // - 세 번째 인자: 권한(Authorities), 사용자가 가진 역할을 부여합니다.
         Authentication authentication = new UsernamePasswordAuthenticationToken(
-            username,
+            userid,
             null,
             Collections.singletonList(new SimpleGrantedAuthority("ROLE_USER"))
         );
@@ -153,7 +153,7 @@ public class JwtAuthenticationFilter implements WebFilter {
         // ServerHttpRequest는 불변(immutable) 객체이므로 mutate()를 통해 새로운 인스턴스를 생성해야 합니다.
         // 'X-Auth-Username' 헤더는 게이트웨이가 인증을 완료했음을 엣지 서버에 알려주는 신뢰의 증표입니다.
         ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
-            .header("X-Auth-Username", username)
+            .header("x-auth-user-id", userid)
             .build();
 
         // 4. 새로운 요청 객체를 포함하는 새로운 ServerWebExchange 객체를 만듭니다.

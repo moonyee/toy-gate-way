@@ -61,3 +61,14 @@ dependencyManagement {
 tasks.named('test') {
     useJUnitPlatform()
 }
+
+jar {
+    enabled = false
+}
+
+// 스프링 부트 실행 가능 jar 생성을 켭니다
+bootJar {
+    enabled = true
+    // 아까 발생한 중복 에러 방지용 전략 추가
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
