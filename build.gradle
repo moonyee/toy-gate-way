@@ -10,7 +10,9 @@ description = 'Gateway Serve'
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
+        // Java 21로 업그레이드. Gateway는 WebFlux/Netty 기반이라
+        // Virtual Threads 직접 이득은 적지만, 전체 스택의 JDK 버전 일관성을 위해 21로 맞춘다.
+        languageVersion = JavaLanguageVersion.of(21)
     }
 }
 
@@ -43,6 +45,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
     implementation 'org.springframework.cloud:spring-cloud-starter-circuitbreaker-reactor-resilience4j'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'io.projectreactor:reactor-test'
