@@ -55,7 +55,8 @@ public class JwtAuthenticationFilter implements WebFilter {
 		"/api/auth/join",
 		"/api/auth/check-id",
 		"/api/auth/check-email",
-		"/api/auth/verify",
+		"/api/v1/auth/verify",
+		"/api/v1/auth/resend",
 		"/api/public/**",
 		"/fallback/**"
 	);
