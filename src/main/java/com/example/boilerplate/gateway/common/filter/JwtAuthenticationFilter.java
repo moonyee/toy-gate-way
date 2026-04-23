@@ -1,17 +1,21 @@
 package com.example.boilerplate.gateway.common.filter;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import lombok.extern.slf4j.Slf4j;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import javax.crypto.SecretKey;
+
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.client.circuitbreaker.ReactiveCircuitBreaker;
 import org.springframework.cloud.client.circuitbreaker.ReactiveCircuitBreakerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
@@ -21,178 +25,182 @@ import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import org.springframework.security.core.context.SecurityContextImpl;
 import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
-
-import javax.crypto.SecretKey;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Mono;
 
 @Slf4j
 @Component
 public class JwtAuthenticationFilter implements WebFilter {
 
-    private final SecretKey signingKey;
-    private static final String BEARER_PREFIX = "Bearer ";
-    private static final String[] LOGIN_PATH = { "/api/auth/login" };
-    private final ReactiveStringRedisTemplate redisTemplate;
+	private static final String BEARER_PREFIX = "Bearer ";
+	/**
+	 * 인증 없이 통과시키는 경로(Ant 패턴).
+	 * AntPathMatcher로 비교하므로 와일드카드가 정상 동작한다.
+	 * 기존 코드는 path.equals()로 비교해 와일드카드가 동작하지 않는 버그가 있었다.
+	 */
+	private static final List<String> PERMIT_PATHS = List.of(
+		"/api/auth/login",
+		"/api/auth/join",
+		"/api/auth/check-id",
+		"/api/auth/check-email",
+		"/api/auth/verify",
+		"/api/public/**",
+		"/fallback/**"
+	);
 
-    private final ReactiveCircuitBreakerFactory circuitBreaker;
+	private static final AntPathMatcher PATH_MATCHER = new AntPathMatcher();
+	private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    public JwtAuthenticationFilter(
-        @Value("${jwt.secret}") String secretKey,
+	private final SecretKey signingKey;
+	private final ReactiveStringRedisTemplate redisTemplate;
+	private final ReactiveCircuitBreaker redisCircuitBreaker;
+
+	public JwtAuthenticationFilter(
+		@Value("${jwt.secret}") String secretKey,
 		ReactiveStringRedisTemplate redisTemplate,
-        ReactiveCircuitBreakerFactory circuitBreaker
-    ) {
-        this.signingKey = Keys.hmacShaKeyFor(secretKey.getBytes(StandardCharsets.UTF_8));
+		ReactiveCircuitBreakerFactory<?, ?> circuitBreakerFactory
+	) {
+		this.signingKey = Keys.hmacShaKeyFor(secretKey.getBytes(StandardCharsets.UTF_8));
 		this.redisTemplate = redisTemplate;
-		this.circuitBreaker = circuitBreaker;
+		// Redis 호출을 감싸 장애 시 즉시 401로 떨어뜨려 Gateway 전체 정체를 막는다.
+		this.redisCircuitBreaker = circuitBreakerFactory.create("redisAuthCB");
 	}
 
-    @Override
-    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        ServerHttpRequest request = exchange.getRequest();
-        log.info("### Request received for path: {}", request.getPath());
-        log.info("### Authorization Header: {}", request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION));
-        String path = request.getPath().value();
+	@Override
+	public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+		ServerHttpRequest request = exchange.getRequest();
+		String path = request.getPath().value();
 
-        // 로그인 경로는 필터를 건너뜁니다
-        for( String loginPath : LOGIN_PATH){
-            if (path.equals(loginPath)) {
-                return chain.filter(exchange);
-            }
-        }
+		// 인증 헤더 전체를 로그에 남기지 않는다. Bearer 여부와 prefix 일부만 노출.
+		if (log.isDebugEnabled()) {
+			log.debug("### Request path: {}, hasAuth: {}", path, hasAuthHeader(request));
+		}
 
-        return extractAndValidateToken(request)
-            .doOnSuccess(jwt -> log.info("### JWT token successfully extracted."))
-            .flatMap(this::parseJwt)
-            .flatMap(claims -> {
-                String userId = claims.getSubject();
-                String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
-                String jwt = authHeader.substring(BEARER_PREFIX.length());
+		for (String permit : PERMIT_PATHS) {
+			if (PATH_MATCHER.match(permit, path)) {
+				return chain.filter(exchange);
+			}
+		}
 
-                // [수정] 고도화된 Redis 키 구조: "AUTH:userId:token"
-                String redisKey = "AUTH:" + userId + ":" + jwt;
+		return extractBearer(request)
+			.flatMap(this::parseJwt)
+			.flatMap(this::verifyRedisSession)
+			.flatMap(claims -> processRequest(exchange, chain, claims))
+			.onErrorResume(ExpiredJwtException.class, e -> {
+				log.warn("### JWT token is expired");
+				return onError(exchange, "JWT token is expired", HttpStatus.UNAUTHORIZED);
+			})
+			.onErrorResume(Exception.class, e -> {
+				log.warn("### Authentication failed: {}", e.getMessage());
+				return onError(exchange, "Invalid JWT token", HttpStatus.UNAUTHORIZED);
+			});
+	}
 
-                log.info("### Gateway checking Redis key: {}", redisKey);
+	private boolean hasAuthHeader(ServerHttpRequest request) {
+		String h = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+		return h != null && h.startsWith(BEARER_PREFIX);
+	}
 
-                return redisTemplate.opsForValue().get(redisKey)
-                    .flatMap(savedToken -> {
-                        // 사실 키 자체에 토큰이 포함되어 있으므로, 데이터가 존재한다는 것만으로도 검증이 됩니다.
-                        if (jwt.equals(savedToken)) {
-                            return Mono.just(claims);
-                        }
-                        return Mono.error(new RuntimeException("Token mismatch"));
-                    })
-                    // Redis에 해당 세션 키가 없으면 로그아웃되었거나 만료된 것으로 간주
-                    .switchIfEmpty(Mono.error(new RuntimeException("No session found in Redis for this token")));
-            })
-            .doOnSuccess(claims -> log.info("### JWT parsed for user: {}", claims.getSubject()))
-            .flatMap(claims -> processRequest(exchange, chain, claims))
-            .doOnSuccess(v -> {
-                // 최종 응답 상태 확인
-                HttpStatusCode status = exchange.getResponse().getStatusCode();
-                log.info("### Final response status: {}", status);
-                // 응답 헤더 확인
-                log.info("### Response headers: {}", exchange.getResponse().getHeaders());
-            })
-            .doOnError(e -> log.error("### Error in filter chain: {}", e.getMessage()))
-            .onErrorResume(ExpiredJwtException.class, e -> {
-                log.error("JWT token is expired: {}", e.getMessage());
-                return onError(exchange, "JWT token is expired", HttpStatus.UNAUTHORIZED);
-            })
-            .onErrorResume(Exception.class, e -> {
-                log.error("### Invalid JWT token or filter error: {}", e.getMessage());
-                return onError(exchange, "Invalid JWT token", HttpStatus.UNAUTHORIZED);
-            });
+	private Mono<String> extractBearer(ServerHttpRequest request) {
+		return Mono.justOrEmpty(request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION))
+			.filter(header -> header.startsWith(BEARER_PREFIX))
+			.map(header -> header.substring(BEARER_PREFIX.length()))
+			.switchIfEmpty(Mono.error(new IllegalArgumentException("Missing or invalid Authorization header")));
+	}
 
-    }
+	private Mono<Claims> parseJwt(String jwt) {
+		// JJWT 파싱은 짧은 CPU 작업이므로 별도 스케줄러 없이 즉시 실행.
+		return Mono.fromCallable(() -> Jwts.parserBuilder()
+			.setSigningKey(signingKey)
+			.build()
+			.parseClaimsJws(jwt)
+			.getBody());
+	}
 
-    private Mono<String> extractAndValidateToken(ServerHttpRequest request) {
-        return Mono.justOrEmpty(request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION))
-            .filter(header -> header.startsWith(BEARER_PREFIX))
-            .map(header -> header.substring(BEARER_PREFIX.length()));
-    }
+	/**
+	 * Redis 세션 키 존재 여부 검증.
+	 * Circuit Breaker로 감싸 Redis 장애 시 즉시 fallback(예외)으로 떨어진다.
+	 * Identity 서비스가 jti(JWT ID)를 사용하므로 키 형식은 `AUTH:{userId}:{jti}`.
+	 */
+	private Mono<Claims> verifyRedisSession(Claims claims) {
+		String userId = claims.getSubject();
+		String jti = claims.getId();
+		if (jti == null || jti.isBlank()) {
+			return Mono.error(new IllegalStateException("JWT missing jti claim"));
+		}
+		String redisKey = "AUTH:" + userId + ":" + jti;
 
-    private Mono<Claims> parseJwt(String jwt) {
-        return Mono.fromCallable(() -> Jwts.parserBuilder()
-                .setSigningKey(signingKey)
-                .build()
-                .parseClaimsJws(jwt)
-                .getBody())
-            .subscribeOn(Schedulers.boundedElastic());
+		Mono<String> lookup = redisTemplate.opsForValue().get(redisKey);
 
-    }
+		return redisCircuitBreaker.run(
+			lookup,
+			throwable -> {
+				log.warn("### Redis circuit open or failure: {}", throwable.toString());
+				return Mono.error(new IllegalStateException("auth cache unavailable"));
+			}
+		)
+		.switchIfEmpty(Mono.error(new IllegalStateException("No active session")))
+		.thenReturn(claims);
+	}
 
-    private Mono<Void> processRequest(ServerWebExchange exchange, WebFilterChain chain, Claims claims) {
-        // 1. JWT Claims(페이로드)에서 사용자 아이디(subject)를 추출합니다.
-        // 'sub'는 JWT 표준 클레임으로, 주로 사용자의 고유 식별자를 담습니다.
-        String userid = claims.getSubject();
+	private Mono<Void> processRequest(ServerWebExchange exchange, WebFilterChain chain, Claims claims) {
+		String userId = claims.getSubject();
+		String role = claims.get("role", String.class);
+		if (role == null || role.isBlank()) {
+			role = "ROLE_USER";
+		}
 
-        // 2. Spring Security용 Authentication 객체를 생성합니다.
-        // UsernamePasswordAuthenticationToken은 인증된 사용자를 나타내는 표준 클래스입니다.
-        // - 첫 번째 인자: 주체(Principal), 즉 사용자 아이디
-        // - 두 번째 인자: 자격 증명(Credentials), 여기서는 이미 토큰 검증을 마쳤으므로 null
-        // - 세 번째 인자: 권한(Authorities), 사용자가 가진 역할을 부여합니다.
-        Authentication authentication = new UsernamePasswordAuthenticationToken(
-            userid,
-            null,
-            Collections.singletonList(new SimpleGrantedAuthority("ROLE_USER"))
-        );
+		Authentication authentication = new UsernamePasswordAuthenticationToken(
+			userId, null, Collections.singletonList(new SimpleGrantedAuthority(role))
+		);
 
-        // 3. 엣지 서버로 전달할 헤더를 추가하여 새로운 요청(ServerHttpRequest) 객체를 만듭니다.
-        // ServerHttpRequest는 불변(immutable) 객체이므로 mutate()를 통해 새로운 인스턴스를 생성해야 합니다.
-        // 'X-Auth-Username' 헤더는 게이트웨이가 인증을 완료했음을 엣지 서버에 알려주는 신뢰의 증표입니다.
-        ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
-            .header("x-auth-user-id", userid)
-            .build();
+		ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
+			.header("x-auth-user-id", userId)
+			.header("x-auth-user-role", role)
+			.build();
 
-        // 4. 새로운 요청 객체를 포함하는 새로운 ServerWebExchange 객체를 만듭니다.
-        // ServerWebExchange 또한 불변 객체이므로, 변경된 요청을 담기 위해 새로운 인스턴스를 생성합니다.
-        ServerWebExchange modifiedExchange = exchange.mutate()
-            .request(modifiedRequest)
-            .build();
+		ServerWebExchange modifiedExchange = exchange.mutate()
+			.request(modifiedRequest)
+			.build();
 
-        // 5. 다음 필터 체인으로 요청을 전달하고, 보안 컨텍스트를 전파합니다.
-        // - chain.filter(modifiedExchange): 변경된 요청을 다음 필터로 넘깁니다.
-        // - .contextWrite(...): Mono의 컨텍스트(Context)에 인증 정보를 저장합니다.
-        //   이를 통해 다음 필터나 컨트롤러에서 ReactiveSecurityContextHolder를 사용해 인증 정보를 꺼내 쓸 수 있습니다.
-        return chain.filter(modifiedExchange)
-            .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(
-                Mono.just(new SecurityContextImpl(authentication))
-            ));
-    }
+		return chain.filter(modifiedExchange)
+			.contextWrite(ReactiveSecurityContextHolder.withSecurityContext(
+				Mono.just(new SecurityContextImpl(authentication))
+			));
+	}
 
-    private Mono<Void> onError(ServerWebExchange exchange, String err, HttpStatus httpStatus) {
-        ServerHttpResponse response = exchange.getResponse();
-        response.setStatusCode(httpStatus);
+	private Mono<Void> onError(ServerWebExchange exchange, String err, HttpStatus httpStatus) {
+		ServerHttpResponse response = exchange.getResponse();
+		response.setStatusCode(httpStatus);
+		response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
-        // JSON 형태의 에러 응답
-        Map<String, Object> errorResponse = new HashMap<>();
-        errorResponse.put("timestamp", Instant.now().toString());
-        errorResponse.put("status", httpStatus.value());
-        errorResponse.put("error", httpStatus.getReasonPhrase());
-        errorResponse.put("message", err);
+		Map<String, Object> errorResponse = new HashMap<>();
+		errorResponse.put("timestamp", Instant.now().toString());
+		errorResponse.put("status", httpStatus.value());
+		errorResponse.put("error", httpStatus.getReasonPhrase());
+		errorResponse.put("message", err);
 
-        byte[] bytes = null;
-        try {
-            bytes = new ObjectMapper().writeValueAsBytes(errorResponse);
-        } catch (JsonProcessingException e) {
-            log.error("Error creating error response", e);
-        }
+		byte[] bytes;
+		try {
+			bytes = MAPPER.writeValueAsBytes(errorResponse);
+		} catch (JsonProcessingException e) {
+			log.error("Error creating error response", e);
+			bytes = ("{\"error\":\"" + httpStatus.getReasonPhrase() + "\"}").getBytes(StandardCharsets.UTF_8);
+		}
 
-        DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
-        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-        return response.writeWith(Mono.just(buffer));
-
-    }
+		DataBuffer buffer = response.bufferFactory().wrap(bytes);
+		return response.writeWith(Mono.just(buffer));
+	}
 }
